@@ -1,0 +1,17 @@
+{
+  "name": "transcriptai",
+  "version": "1.0.0",
+  "description": "AI-powered video & audio transcription tool",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^2.7.0"
+  }
+}
