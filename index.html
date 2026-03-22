@@ -138,6 +138,14 @@
 mark{background:#fbbf2444;color:inherit;border-radius:2px;padding:0 1px}
 .hidden{display:none}
 .chev{transition:transform .2s;color:var(--dim)}
+/* History items */
+.hist-item{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;background:var(--card);border:1px solid var(--border);border-radius:12px;cursor:pointer;transition:all .15s;gap:12px}
+.hist-item:hover{border-color:var(--bAccent);background:#13161e}
+.hist-title{font-size:14px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:400px}
+.hist-meta{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--dim);margin-top:4px}
+.hist-badge{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:600}
+.hist-del{background:none;border:none;color:var(--dim);cursor:pointer;padding:4px 8px;font-size:14px;border-radius:6px;transition:all .15s;flex-shrink:0}
+.hist-del:hover{background:#ff000022;color:#f66}
 </style>
 </head>
 <body>
@@ -186,6 +194,16 @@ mark{background:#fbbf2444;color:inherit;border-radius:2px;padding:0 1px}
       <div class="badges"><span class="badge mono">MP4</span><span class="badge mono">MOV</span><span class="badge mono">MKV</span><span class="badge mono">MP3</span><span class="badge mono">WAV</span><span class="badge mono">M4A</span><span class="badge mono">FLAC</span><span class="badge mono">OGG</span><span class="badge mono">AAC</span></div>
       <p class="hint">Maximum file size: 50 MB</p>
     </div>
+
+    <!-- Saved Transcripts History -->
+    <div id="historySection" style="margin-top:20px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h3 style="font-size:15px;font-weight:600;color:var(--muted)">📂 Saved Transcripts</h3>
+        <span class="mono" id="historyCount" style="font-size:11.5px;color:var(--dim)"></span>
+      </div>
+      <div id="historyList" style="display:flex;flex-direction:column;gap:6px"></div>
+      <p id="historyEmpty" class="hidden" style="text-align:center;padding:24px;color:var(--dim);font-size:13px">No saved transcripts yet. Transcribe a video or audio file, then click 💾 Save.</p>
+    </div>
   </div>
 
   <!-- Processing -->
@@ -221,6 +239,7 @@ mark{background:#fbbf2444;color:inherit;border-radius:2px;padding:0 1px}
         </div>
         <button class="btn btn-sm" onclick="copyTranscript()"><span id="copyLabel">📋 Copy</span></button>
         <button class="btn btn-sm" id="undoBtn" style="display:none" onclick="undoEdit()">↩ Undo</button>
+        <button class="btn btn-sm" id="saveBtn" onclick="saveTranscript()">💾 Save</button>
         <button class="btn btn-sm btn-accent" onclick="showExport()">⬆ Export</button>
       </div>
     </div>
@@ -550,12 +569,81 @@ function renderTopicsTab(){
 }
 
 /* ═══ RESET ═══ */
+/* ═══ TRANSCRIPT HISTORY ═══ */
+async function loadHistory(){
+  try{
+    const r=await fetch("/api/history");
+    const d=await r.json();
+    if(!d.success)return;
+    const list=d.history||[];
+    $("historyCount").textContent=`${list.length} saved`;
+    if(list.length===0){show("historyEmpty");$("historyList").innerHTML="";return;}
+    hide("historyEmpty");
+    $("historyList").innerHTML=list.map(h=>{
+      const date=new Date(h.savedAt).toLocaleDateString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+      const srcBadge=h.source==="youtube"
+        ?`<span class="hist-badge" style="background:#ff00001a;color:#f66">YouTube</span>`
+        :`<span class="hist-badge" style="background:#00ff881a;color:#0fa">${h.fileType==="video"?"Video":"Audio"}</span>`;
+      return `<div class="hist-item" onclick="loadSaved('${h.id}')">
+        <div style="min-width:0;flex:1">
+          <div class="hist-title">${h.title}</div>
+          <div class="hist-meta">
+            ${srcBadge}
+            <span class="mono">${fmtTime(h.totalDuration||0)}</span>
+            <span>${h.wordCount?.toLocaleString()||0} words</span>
+            <span>${date}</span>
+          </div>
+        </div>
+        <button class="hist-del" onclick="event.stopPropagation();deleteSaved('${h.id}')" title="Delete">🗑</button>
+      </div>`;
+    }).join("");
+  }catch(_){}
+}
+
+async function saveTranscript(){
+  if(!state.transcript)return;
+  const t=state.transcript;
+  const r=await fetch("/api/history",{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({title:t.title,source:t.source,videoId:t.videoId,language:t.language,totalDuration:t.totalDuration,entries:t.entries,fileType:t.fileType,fileSize:t.fileSize}),
+  });
+  const d=await r.json();
+  if(d.success){
+    $("saveBtn").innerHTML="✅ Saved!";
+    setTimeout(()=>$("saveBtn").innerHTML="💾 Save",2000);
+  }else{showError(d.error||"Failed to save");}
+}
+
+async function loadSaved(id){
+  try{
+    const r=await fetch(`/api/history/${id}`);
+    const d=await r.json();
+    if(!d.success){showError(d.error);return;}
+    const h=d.transcript;
+    state.transcript={source:h.source,title:h.title,videoId:h.videoId,language:h.language,totalDuration:h.totalDuration,entries:h.entries,fileType:h.fileType,fileSize:h.fileSize};
+    state.editHistory=[];state.aiSummary=null;state.aiSpeakers=null;state.aiTopics=null;
+    hide("inputSection");hide("procCard");
+    renderResult();
+  }catch(e){showError("Failed to load transcript");}
+}
+
+async function deleteSaved(id){
+  if(!confirm("Delete this saved transcript?"))return;
+  await fetch(`/api/history/${id}`,{method:"DELETE"});
+  loadHistory();
+}
+
+// Load history on page load
+loadHistory();
+
+/* ═══ RESET ═══ */
 function resetAll(){
   state={transcript:null,aiSummary:null,aiSpeakers:null,aiTopics:null,editHistory:[],activeTab:"transcript",withTimestamps:true,playerVisible:false};
   hide("resultSection");hide("newBtn");hide("procCard");hide("aiBadge");hideError();
   show("inputSection");$("urlInput").value="";
   $("aiSumBtn").innerHTML="📄 Summary";$("aiSpkBtn").innerHTML="👥 Speakers";$("aiTopBtn").innerHTML="🔲 Topics";
   $("searchInput").value="";clearSearch();
+  loadHistory(); // refresh history when going back
 }
 
 /* ═══ KEYBOARD SHORTCUTS ═══ */
