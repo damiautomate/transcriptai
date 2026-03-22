@@ -71,8 +71,11 @@ app.get("/api/youtube/:videoId", async (req, res) => {
     // ── METHOD 2: Caption URL with cookies ──
     const capMatch = html.match(/"captionTracks"\s*:\s*(\[.*?\])/);
     if (!capMatch) {
-      if (html.includes("Sign in to confirm")) throw new Error("Age-restricted video.");
-      throw new Error("No captions found for this video.");
+      // Only flag age-restricted if playability specifically says so
+      if (html.includes('"playabilityStatus"') && html.includes('"LOGIN_REQUIRED"')) throw new Error("Age-restricted video. Try a different one.");
+      if (html.includes('"playabilityStatus"') && html.includes('"UNPLAYABLE"')) throw new Error("Video is unavailable or private.");
+      console.log(`[YT] No captionTracks found. Has 'captions': ${html.includes('"captions"')}, has 'captionTracks': ${html.includes('captionTracks')}`);
+      throw new Error("No captions found for this video. It may not have subtitles enabled.");
     }
 
     let tracks;
@@ -125,21 +128,27 @@ app.get("/api/youtube/:videoId", async (req, res) => {
 
 /* ── Innertube transcript fetch ── */
 async function fetchViaInnertube(videoId, html) {
-  // Extract API key
   const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
   const apiKey = apiKeyMatch ? apiKeyMatch[1] : "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
   
-  // Try to get serializedShareEntity or use video ID directly
+  // Proper protobuf encoding for get_transcript params
+  // Field 1 (LEN) > Field 1 (LEN) > videoId
+  const videoIdBytes = Buffer.from(videoId, "utf8");
+  const inner = Buffer.concat([Buffer.from([0x0a, videoIdBytes.length]), videoIdBytes]);
+  const outer = Buffer.concat([Buffer.from([0x0a, inner.length]), inner]);
+  const params = outer.toString("base64");
+  console.log(`[YT] Innertube params: ${params}`);
+
   const body = {
     context: {
       client: {
         clientName: "WEB",
-        clientVersion: "2.20240313.05.00",
+        clientVersion: "2.20250320.01.00",
         hl: "en",
         gl: "US",
       }
     },
-    params: Buffer.from(`\n\x0b${videoId}`).toString("base64"),
+    params,
   };
 
   const r = await fetch(`https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`, {
@@ -148,8 +157,14 @@ async function fetchViaInnertube(videoId, html) {
     body: JSON.stringify(body),
   });
 
-  if (!r.ok) throw new Error(`Innertube HTTP ${r.status}`);
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    throw new Error(`Innertube HTTP ${r.status}: ${errText.slice(0, 150)}`);
+  }
   const data = await r.json();
+  console.log(`[YT] Innertube response keys: ${Object.keys(data).join(", ")}`);
+  if (data.actions) console.log(`[YT] Innertube actions: ${data.actions.length}`);
+  else console.log(`[YT] Innertube: no actions, top keys: ${JSON.stringify(data).slice(0, 200)}`);
 
   // Parse innertube transcript response
   const actions = data?.actions;
