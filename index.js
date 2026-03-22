@@ -7,142 +7,224 @@ const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 app.use(express.json({ limit: "50mb" }));
-
-app.get("/api/health", (req, res) => res.json({ status: "ok", uptime: process.uptime() }));
+app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 /* ══════════════════════════════════════════════════════════
    YOUTUBE TRANSCRIPT ENDPOINT
    ══════════════════════════════════════════════════════════ */
 app.get("/api/youtube/:videoId", async (req, res) => {
   const { videoId } = req.params;
-  console.log(`[YouTube] Fetching transcript for: ${videoId}`);
+  console.log(`[YT] Fetching: ${videoId}`);
 
   try {
-    // ── METHOD 1: Invidious API ──
-    const INSTANCES = [
-      "https://inv.nadeko.net",
-      "https://invidious.nerdvpn.de",
-      "https://iv.datura.network",
-      "https://yewtu.be",
-      "https://inv.tux.pizza",
-      "https://invidious.fdn.fr",
-      "https://invidious.protokolla.fi",
-    ];
+    // ── Fetch YouTube page WITH cookies ──
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    };
 
-    for (const instance of INSTANCES) {
-      try {
-        console.log(`[YouTube] Trying Invidious: ${instance}`);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
-        const infoR = await fetch(`${instance}/api/v1/videos/${videoId}?fields=title,captions,lengthSeconds`, { signal: controller.signal });
-        clearTimeout(timeout);
-        if (!infoR.ok) { console.log(`[YouTube] ${instance} returned ${infoR.status}`); continue; }
-        const info = await infoR.json();
-        const caps = info.captions;
-        if (!caps || caps.length === 0) { console.log(`[YouTube] ${instance} — no captions`); continue; }
-        const track = caps.find(c => c.language_code === "en") || caps.find(c => c.language_code?.startsWith("en")) || caps[0];
-        if (!track) continue;
-        const capUrl = track.url?.startsWith("http") ? track.url : `${instance}${track.url}`;
-        console.log(`[YouTube] Fetching captions: ${capUrl.slice(0, 100)}...`);
-        const capR = await fetch(capUrl);
-        if (!capR.ok) { console.log(`[YouTube] Caption fetch failed: ${capR.status}`); continue; }
-        const capText = await capR.text();
-        console.log(`[YouTube] Caption length: ${capText.length}, preview: ${capText.slice(0, 100)}`);
-        const entries = parseCapXml(capText);
-        if (entries.length === 0) { console.log(`[YouTube] Parsed 0 entries from XML`); continue; }
-        console.log(`[YouTube] SUCCESS via ${instance} — ${entries.length} entries`);
-        return res.json({ success: true, title: info.title || "YouTube Video", language: track.language_code || "en", totalDuration: info.lengthSeconds || 0, entries });
-      } catch (e) { console.log(`[YouTube] ${instance} error: ${e.message}`); continue; }
+    // First request to get consent cookie
+    console.log("[YT] Fetching YouTube page...");
+    const ytR = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers, redirect: "manual" });
+    
+    // Capture cookies from response
+    const rawCookies = ytR.headers.raw()["set-cookie"] || [];
+    const cookieStr = rawCookies.map(c => c.split(";")[0]).join("; ");
+    console.log(`[YT] Got ${rawCookies.length} cookies`);
+
+    // Follow redirect if needed, with cookies
+    let html;
+    if (ytR.status >= 300 && ytR.status < 400) {
+      const loc = ytR.headers.get("location");
+      console.log(`[YT] Following redirect to: ${loc?.slice(0, 80)}`);
+      const ytR2 = await fetch(loc || `https://www.youtube.com/watch?v=${videoId}`, { headers: { ...headers, Cookie: cookieStr } });
+      html = await ytR2.text();
+    } else {
+      html = await ytR.text();
     }
 
-    // ── METHOD 2: Direct YouTube + JSON3 format ──
-    console.log("[YouTube] Invidious all failed. Trying direct YouTube...");
-    const ytR = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml",
-      },
-    });
-    if (!ytR.ok) throw new Error(`YouTube returned HTTP ${ytR.status}`);
-    const html = await ytR.text();
-    console.log(`[YouTube] Page length: ${html.length}`);
+    // Handle consent page
+    if (html.includes("CONSENT") && html.includes("consent.youtube.com")) {
+      console.log("[YT] Consent page detected, bypassing...");
+      const consentHeaders = { ...headers, Cookie: "CONSENT=YES+; " + cookieStr };
+      const ytR3 = await fetch(`https://www.youtube.com/watch?v=${videoId}`, { headers: consentHeaders });
+      html = await ytR3.text();
+    }
 
+    console.log(`[YT] Page: ${html.length} chars`);
+
+    // Extract title
     const tMatch = html.match(/<title>(.*?)<\/title>/);
     const title = tMatch ? tMatch[1].replace(/ - YouTube$/, "").trim() : "YouTube Video";
 
+    // ── METHOD 1: Innertube API for transcript ──
+    console.log("[YT] Trying Innertube API...");
+    try {
+      const innerResult = await fetchViaInnertube(videoId, html);
+      if (innerResult && innerResult.length > 0) {
+        console.log(`[YT] SUCCESS via Innertube — ${innerResult.length} entries`);
+        return res.json({ success: true, title, language: "en", totalDuration: innerResult[innerResult.length - 1]?.timestamp || 0, entries: innerResult });
+      }
+    } catch (e) { console.log(`[YT] Innertube failed: ${e.message}`); }
+
+    // ── METHOD 2: Caption URL with cookies ──
     const capMatch = html.match(/"captionTracks"\s*:\s*(\[.*?\])/);
     if (!capMatch) {
-      if (html.includes("Sign in to confirm")) throw new Error("Age-restricted video. Try a different one.");
-      console.log(`[YouTube] No captionTracks in page. 'captions' present: ${html.includes("captions")}`);
+      if (html.includes("Sign in to confirm")) throw new Error("Age-restricted video.");
       throw new Error("No captions found for this video.");
     }
 
     let tracks;
     try { tracks = JSON.parse(capMatch[1]); } catch (_) { throw new Error("Failed to parse captions."); }
-    console.log(`[YouTube] ${tracks.length} tracks: ${tracks.map(t => `${t.languageCode}(${t.kind || "manual"})`).join(", ")}`);
+    console.log(`[YT] ${tracks.length} tracks: ${tracks.map(t => `${t.languageCode}(${t.kind || "std"})`).join(", ")}`);
 
     const track = tracks.find(t => t.languageCode === "en") || tracks.find(t => t.languageCode?.startsWith("en")) || tracks[0];
-    if (!track?.baseUrl) throw new Error("No caption URL found.");
+    if (!track?.baseUrl) throw new Error("No caption URL.");
 
-    // ── Try JSON3 first ──
-    console.log("[YouTube] Trying JSON3 format...");
-    try {
-      const j3Url = track.baseUrl + "&fmt=json3";
-      const j3R = await fetch(j3Url);
-      if (j3R.ok) {
-        const j3 = await j3R.json();
-        if (j3.events) {
-          const entries = parseJson3(j3);
-          if (entries.length > 0) {
-            console.log(`[YouTube] SUCCESS via JSON3 — ${entries.length} entries`);
-            return res.json({ success: true, title, language: track.languageCode || "en", totalDuration: entries[entries.length - 1]?.timestamp || 0, entries });
-          }
-          console.log(`[YouTube] JSON3 had ${j3.events.length} events but parsed 0 entries`);
+    // Fetch with cookies and all formats
+    const fetchHeaders = { ...headers, Cookie: "CONSENT=YES+; " + cookieStr };
+    const formats = [
+      { name: "json3", url: track.baseUrl + "&fmt=json3", parser: parseJson3Response },
+      { name: "srv3", url: track.baseUrl + "&fmt=srv3", parser: parseSrv3 },
+      { name: "xml", url: track.baseUrl, parser: parseCapXml },
+    ];
+
+    for (const fmt of formats) {
+      try {
+        console.log(`[YT] Trying ${fmt.name}...`);
+        const r = await fetch(fmt.url, { headers: fetchHeaders });
+        if (!r.ok) { console.log(`[YT] ${fmt.name} HTTP ${r.status}`); continue; }
+        const text = await r.text();
+        console.log(`[YT] ${fmt.name}: ${text.length} chars`);
+        if (text.length < 10) { console.log(`[YT] ${fmt.name} empty`); continue; }
+        
+        let entries;
+        if (fmt.name === "json3") {
+          const json = JSON.parse(text);
+          entries = fmt.parser(json);
+        } else {
+          entries = fmt.parser(text);
         }
-      }
-    } catch (e) { console.log(`[YouTube] JSON3 error: ${e.message}`); }
-
-    // ── Try srv3 ──
-    console.log("[YouTube] Trying srv3 format...");
-    try {
-      const s3Url = track.baseUrl + "&fmt=srv3";
-      const s3R = await fetch(s3Url);
-      if (s3R.ok) {
-        const s3Text = await s3R.text();
-        console.log(`[YouTube] srv3 length: ${s3Text.length}, preview: ${s3Text.slice(0, 120)}`);
-        const entries = parseSrv3(s3Text);
+        
         if (entries.length > 0) {
-          console.log(`[YouTube] SUCCESS via srv3 — ${entries.length} entries`);
+          console.log(`[YT] SUCCESS via ${fmt.name} — ${entries.length} entries`);
           return res.json({ success: true, title, language: track.languageCode || "en", totalDuration: entries[entries.length - 1]?.timestamp || 0, entries });
         }
-      }
-    } catch (e) { console.log(`[YouTube] srv3 error: ${e.message}`); }
-
-    // ── Try plain XML ──
-    console.log("[YouTube] Trying plain XML...");
-    const capR = await fetch(track.baseUrl);
-    if (!capR.ok) throw new Error(`Caption download HTTP ${capR.status}`);
-    const capXml = await capR.text();
-    console.log(`[YouTube] XML length: ${capXml.length}, preview: ${capXml.slice(0, 150)}`);
-    const entries = parseCapXml(capXml);
-    if (entries.length > 0) {
-      console.log(`[YouTube] SUCCESS via XML — ${entries.length} entries`);
-      return res.json({ success: true, title, language: track.languageCode || "en", totalDuration: entries[entries.length - 1]?.timestamp || 0, entries });
+        console.log(`[YT] ${fmt.name} parsed 0 entries`);
+      } catch (e) { console.log(`[YT] ${fmt.name} error: ${e.message}`); }
     }
 
-    throw new Error("Could not parse captions in any format (JSON3, srv3, XML). Try a different video.");
+    throw new Error("Found captions but could not download them. YouTube may be blocking this server's IP. Try again later.");
 
   } catch (err) {
-    console.error(`[YouTube] FAILED:`, err.message);
+    console.error(`[YT] FAILED: ${err.message}`);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-/* ── Parse XML captions ── */
+/* ── Innertube transcript fetch ── */
+async function fetchViaInnertube(videoId, html) {
+  // Extract API key
+  const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+  const apiKey = apiKeyMatch ? apiKeyMatch[1] : "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+  
+  // Try to get serializedShareEntity or use video ID directly
+  const body = {
+    context: {
+      client: {
+        clientName: "WEB",
+        clientVersion: "2.20240313.05.00",
+        hl: "en",
+        gl: "US",
+      }
+    },
+    params: Buffer.from(`\n\x0b${videoId}`).toString("base64"),
+  };
+
+  const r = await fetch(`https://www.youtube.com/youtubei/v1/get_transcript?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    body: JSON.stringify(body),
+  });
+
+  if (!r.ok) throw new Error(`Innertube HTTP ${r.status}`);
+  const data = await r.json();
+
+  // Parse innertube transcript response
+  const actions = data?.actions;
+  if (!actions) throw new Error("No actions in response");
+
+  const transcriptRenderer = actions[0]?.updateEngagementPanelAction?.content?.transcriptRenderer;
+  const body2 = transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body || transcriptRenderer?.body;
+  const sectionRenderer = body2?.transcriptSectionListRenderer || body2?.transcriptSegmentListRenderer;
+  
+  if (!sectionRenderer) {
+    // Try alternate path
+    const segments = findTranscriptSegments(data);
+    if (segments.length > 0) return groupIntoParagraphs(segments);
+    throw new Error("No transcript segments found");
+  }
+
+  const sections = sectionRenderer.contents || [];
+  const raw = [];
+  
+  for (const section of sections) {
+    const renderer = section.transcriptSectionRenderer || section.transcriptSegmentRenderer;
+    if (!renderer) continue;
+    
+    // Direct segments
+    if (renderer.startMs != null) {
+      const text = extractText(renderer.snippet || renderer);
+      if (text) raw.push({ start: parseInt(renderer.startMs) / 1000, duration: parseInt(renderer.endMs || "0") / 1000 - parseInt(renderer.startMs) / 1000, text });
+      continue;
+    }
+    
+    // Nested segments
+    const contents = renderer.contents || [];
+    for (const item of contents) {
+      const seg = item.transcriptSegmentRenderer;
+      if (!seg) continue;
+      const text = extractText(seg.snippet || seg);
+      const startMs = parseInt(seg.startMs || "0");
+      const endMs = parseInt(seg.endMs || "0");
+      if (text) raw.push({ start: startMs / 1000, duration: (endMs - startMs) / 1000, text });
+    }
+  }
+
+  return groupIntoParagraphs(raw);
+}
+
+function findTranscriptSegments(obj) {
+  const segments = [];
+  const search = (o) => {
+    if (!o || typeof o !== "object") return;
+    if (o.transcriptSegmentRenderer) {
+      const seg = o.transcriptSegmentRenderer;
+      const text = extractText(seg.snippet || seg);
+      if (text) segments.push({ start: parseInt(seg.startMs || "0") / 1000, duration: (parseInt(seg.endMs || "0") - parseInt(seg.startMs || "0")) / 1000, text });
+      return;
+    }
+    if (Array.isArray(o)) o.forEach(search);
+    else Object.values(o).forEach(search);
+  };
+  search(obj);
+  return segments;
+}
+
+function extractText(obj) {
+  if (!obj) return "";
+  if (typeof obj === "string") return obj;
+  if (obj.simpleText) return obj.simpleText;
+  if (obj.runs) return obj.runs.map(r => r.text || "").join("");
+  if (obj.text) return extractText(obj.text);
+  if (obj.snippet) return extractText(obj.snippet);
+  return "";
+}
+
+/* ── Parsers ── */
 function parseCapXml(xml) {
   const raw = [];
-  // Pattern 1: standard <text start="" dur="">
   let regex = /<text\s+start="([^"]*)"(?:\s+dur="([^"]*)")?[^>]*>([\s\S]*?)<\/text>/g;
   let match;
   while ((match = regex.exec(xml)) !== null) {
@@ -150,8 +232,6 @@ function parseCapXml(xml) {
     if (text) raw.push({ start: parseFloat(match[1]), duration: parseFloat(match[2] || "0"), text });
   }
   if (raw.length > 0) return groupIntoParagraphs(raw);
-
-  // Pattern 2: <text t="" d=""> (milliseconds)
   regex = /<text\s+t="([^"]*)"(?:\s+d="([^"]*)")?[^>]*>([\s\S]*?)<\/text>/g;
   while ((match = regex.exec(xml)) !== null) {
     const text = decodeEntities(match[3]).trim();
@@ -160,8 +240,7 @@ function parseCapXml(xml) {
   return groupIntoParagraphs(raw);
 }
 
-/* ── Parse JSON3 format ── */
-function parseJson3(json) {
+function parseJson3Response(json) {
   const raw = [];
   if (!json.events) return [];
   for (const event of json.events) {
@@ -172,7 +251,6 @@ function parseJson3(json) {
   return groupIntoParagraphs(raw);
 }
 
-/* ── Parse srv3 format ── */
 function parseSrv3(xml) {
   const raw = [];
   const regex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
@@ -184,9 +262,7 @@ function parseSrv3(xml) {
   return groupIntoParagraphs(raw);
 }
 
-function decodeEntities(s) {
-  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&#x27;|&apos;/g, "'").replace(/\n/g, " ");
-}
+function decodeEntities(s) { return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&#x27;|&apos;/g, "'").replace(/\n/g, " "); }
 
 function groupIntoParagraphs(raw) {
   if (raw.length === 0) return [];
@@ -204,63 +280,55 @@ function groupIntoParagraphs(raw) {
 }
 
 /* ══════════════════════════════════════════════════════════
-   FILE TRANSCRIPTION ENDPOINT
+   FILE TRANSCRIPTION
    ══════════════════════════════════════════════════════════ */
 app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ success: false, error: "No file uploaded." });
-  console.log(`[Transcribe] Processing: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(1)} MB)`);
+  console.log(`[TR] Processing: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(1)} MB)`);
   const mimeMap = { mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", flac: "audio/flac", ogg: "audio/ogg", aac: "audio/aac", wma: "audio/x-ms-wma", opus: "audio/opus", mp4: "video/mp4", mov: "video/quicktime", avi: "video/x-msvideo", mkv: "video/x-matroska", webm: "video/webm" };
   const ext = req.file.originalname.split(".").pop().toLowerCase();
   const mime = mimeMap[ext] || req.file.mimetype || "audio/mpeg";
   try {
     let result = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let a = 0; a < 3; a++) {
       try {
-        console.log(`[Transcribe] Attempt ${attempt + 1}/3 (${mime})...`);
+        console.log(`[TR] Attempt ${a + 1}/3 (${mime})...`);
         const r = await fetch("https://api-inference.huggingface.co/models/openai/whisper-small", { method: "POST", headers: { "Content-Type": mime }, body: req.file.buffer });
         if (r.ok) { result = await r.json(); break; }
-        const errBody = await r.json().catch(() => ({}));
-        if (errBody.error?.includes("loading") || r.status === 503) { console.log("[Transcribe] Model loading..."); await new Promise(r => setTimeout(r, 15000)); continue; }
-        if (r.status === 429) { console.log("[Transcribe] Rate limited..."); await new Promise(r => setTimeout(r, 10000)); continue; }
-        throw new Error(errBody.error || `Whisper HTTP ${r.status}`);
-      } catch (e) { if (attempt === 2) throw e; console.log(`[Transcribe] Retry: ${e.message}`); await new Promise(r => setTimeout(r, 5000)); }
+        const e = await r.json().catch(() => ({}));
+        if (e.error?.includes("loading") || r.status === 503) { console.log("[TR] Model loading..."); await new Promise(r => setTimeout(r, 15000)); continue; }
+        if (r.status === 429) { console.log("[TR] Rate limited..."); await new Promise(r => setTimeout(r, 10000)); continue; }
+        throw new Error(e.error || `HTTP ${r.status}`);
+      } catch (e) { if (a === 2) throw e; await new Promise(r => setTimeout(r, 5000)); }
     }
-    if (!result) throw new Error("Transcription service unavailable.");
-    console.log(`[Transcribe] Result: text=${result.text ? "yes" : "no"}, chunks=${result.chunks?.length || 0}`);
-
+    if (!result) throw new Error("Transcription unavailable.");
+    console.log(`[TR] Result: text=${!!result.text}, chunks=${result.chunks?.length || 0}`);
     let entries = [];
     if (result.chunks?.length > 0) entries = result.chunks.map(ch => ({ timestamp: ch.timestamp?.[0] ?? 0, text: (ch.text || "").trim() })).filter(e => e.text);
-    else if (result.text) {
-      const ss = result.text.match(/[^.!?]+[.!?]+/g) || [result.text];
-      const tc = ss.reduce((s, t) => s + t.length, 0);
-      let el = 0;
-      entries = ss.map(s => { const en = { timestamp: el, text: s.trim() }; el += (s.length / tc) * (ss.length * 5); return en; }).filter(e => e.text);
-    }
+    else if (result.text) { const ss = result.text.match(/[^.!?]+[.!?]+/g) || [result.text]; const tc = ss.reduce((s, t) => s + t.length, 0); let el = 0; entries = ss.map(s => { const en = { timestamp: el, text: s.trim() }; el += (s.length / tc) * ss.length * 5; return en; }).filter(e => e.text); }
     const para = groupIntoParagraphs(entries.map(e => ({ start: e.timestamp, duration: 2, text: e.text })));
-    console.log(`[Transcribe] SUCCESS — ${para.length} paragraphs`);
+    console.log(`[TR] SUCCESS — ${para.length} paragraphs`);
     res.json({ success: true, entries: para.length > 0 ? para : entries });
-  } catch (err) { console.error(`[Transcribe] FAILED:`, err.message); res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { console.error(`[TR] FAILED: ${err.message}`); res.status(500).json({ success: false, error: err.message }); }
 });
 
 /* ══════════════════════════════════════════════════════════
-   CLAUDE AI ANALYSIS ENDPOINT
+   AI ANALYSIS
    ══════════════════════════════════════════════════════════ */
 app.post("/api/analyze", async (req, res) => {
   const { system, prompt } = req.body;
-  console.log("[AI] Running...");
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY || "", "anthropic-version": "2023-06-01" },
       body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system, messages: [{ role: "user", content: prompt }] }),
     });
-    if (!r.ok) { const err = await r.text(); throw new Error(`Claude HTTP ${r.status}: ${err.slice(0, 200)}`); }
+    if (!r.ok) throw new Error(`Claude HTTP ${r.status}`);
     const data = await r.json();
     res.json({ success: true, text: data.content?.map(b => b.text || "").join("") || "" });
-  } catch (err) { console.error("[AI] FAILED:", err.message); res.status(500).json({ success: false, error: err.message }); }
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
-/* ── Serve frontend ── */
 app.get("*", (req, res) => { res.sendFile(path.join(__dirname, "index.html")); });
 
 const PORT = process.env.PORT || 3000;
