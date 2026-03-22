@@ -298,14 +298,18 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         console.log(`[TR] Attempt ${attempt + 1}/3 (${mime})...`);
-        const r = await fetch("https://api-inference.huggingface.co/models/openai/whisper-small", {
-          method: "POST", headers: { "Content-Type": mime }, body: req.file.buffer,
+        const hfToken = process.env.HF_TOKEN || "";
+        const hfHeaders = { "Content-Type": mime };
+        if (hfToken) hfHeaders["Authorization"] = `Bearer ${hfToken}`;
+        
+        const r = await fetch("https://router.huggingface.co/hf-inference/models/openai/whisper-large-v3-turbo", {
+          method: "POST", headers: hfHeaders, body: req.file.buffer,
         });
         if (r.ok) { result = await r.json(); break; }
         const e = await r.json().catch(() => ({}));
         if (e.error?.includes("loading") || r.status === 503) { console.log("[TR] Loading..."); await new Promise(r => setTimeout(r, 15000)); continue; }
         if (r.status === 429) { console.log("[TR] Rate limited..."); await new Promise(r => setTimeout(r, 10000)); continue; }
-        throw new Error(e.error || `HTTP ${r.status}`);
+        throw new Error(e.error || (r.status === 410 || r.status === 403 ? "HuggingFace requires a free API token. Set HF_TOKEN in Railway variables (get one free at huggingface.co/settings/tokens)." : `HTTP ${r.status}`));
       } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 5000)); }
     }
     if (!result) throw new Error("Transcription unavailable after retries.");
@@ -346,6 +350,77 @@ app.post("/api/analyze", async (req, res) => {
   } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
+/* ══════════════════════════════════════════════════════════
+   TRANSCRIPT HISTORY & CACHING
+   ══════════════════════════════════════════════════════════ */
+import { readFileSync, writeFileSync, existsSync } from "fs";
+
+const HISTORY_FILE = join(__dirname, "history.json");
+let history = [];
+
+// Load history from disk on startup
+try {
+  if (existsSync(HISTORY_FILE)) {
+    history = JSON.parse(readFileSync(HISTORY_FILE, "utf8"));
+    console.log(`[HIST] Loaded ${history.length} saved transcripts`);
+  }
+} catch (_) { history = []; }
+
+function saveHistory() {
+  try { writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2)); } catch (_) {}
+}
+
+// Save a transcript
+app.post("/api/history", (req, res) => {
+  const { title, source, videoId, language, totalDuration, entries, fileType, fileSize } = req.body;
+  if (!entries || entries.length === 0) return res.status(400).json({ success: false, error: "No entries to save" });
+
+  const item = {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+    title: title || "Untitled",
+    source: source || "unknown",
+    videoId: videoId || null,
+    language: language || "en",
+    totalDuration: totalDuration || 0,
+    fileType: fileType || null,
+    fileSize: fileSize || null,
+    entryCount: entries.length,
+    wordCount: entries.reduce((c, e) => c + (e.text || "").split(/\s+/).filter(Boolean).length, 0),
+    entries,
+    savedAt: new Date().toISOString(),
+  };
+
+  history.unshift(item); // newest first
+  if (history.length > 50) history = history.slice(0, 50); // cap at 50
+  saveHistory();
+  console.log(`[HIST] Saved: "${item.title}" (${item.id})`);
+  res.json({ success: true, id: item.id });
+});
+
+// Get history list (without full entries for speed)
+app.get("/api/history", (req, res) => {
+  const list = history.map(({ id, title, source, videoId, language, totalDuration, entryCount, wordCount, savedAt, fileType }) => ({
+    id, title, source, videoId, language, totalDuration, entryCount, wordCount, savedAt, fileType,
+  }));
+  res.json({ success: true, history: list });
+});
+
+// Get a single saved transcript (with full entries)
+app.get("/api/history/:id", (req, res) => {
+  const item = history.find(h => h.id === req.params.id);
+  if (!item) return res.status(404).json({ success: false, error: "Transcript not found" });
+  res.json({ success: true, transcript: item });
+});
+
+// Delete a saved transcript
+app.delete("/api/history/:id", (req, res) => {
+  const idx = history.findIndex(h => h.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ success: false, error: "Not found" });
+  history.splice(idx, 1);
+  saveHistory();
+  res.json({ success: true });
+});
+
 /* ── Serve frontend ── */
 app.get("*", (req, res) => res.sendFile(join(__dirname, "index.html")));
 
@@ -356,8 +431,9 @@ app.listen(PORT, "0.0.0.0", () => {
   ║         TranscriptAI v1.0                ║
   ║   Port: ${PORT}                              ║
   ║   YouTube:  ✅ (3-method fallback)        ║
-  ║   Upload:   ✅ (Whisper AI)               ║
+  ║   Upload:   ${process.env.HF_TOKEN ? "✅ Ready" : "⚠️  Set HF_TOKEN for uploads"}               ║
   ║   AI:       ${process.env.ANTHROPIC_API_KEY ? "✅ Ready" : "⚠️  Set ANTHROPIC_API_KEY"}                     ║
+  ║   History:  ✅ (${history.length} saved)                ║
   ╚══════════════════════════════════════════╝
   `);
 });
