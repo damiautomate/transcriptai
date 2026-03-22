@@ -3,9 +3,15 @@ import multer from "multer";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
-// Import youtube-transcript ESM build directly (package exports are broken for Node ESM resolver)
-const ytModule = await import("./node_modules/youtube-transcript/dist/youtube-transcript.esm.js");
-const { fetchTranscript } = ytModule;
+// Import youtube-transcript ESM build
+let fetchTranscriptPkg;
+try {
+  const ytModule = await import("./node_modules/youtube-transcript/dist/youtube-transcript.esm.js");
+  fetchTranscriptPkg = ytModule.fetchTranscript;
+  console.log("[INIT] youtube-transcript package loaded ✅");
+} catch (e) {
+  console.log("[INIT] youtube-transcript package not available:", e.message);
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -13,81 +19,246 @@ const __dirname = dirname(__filename);
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 app.use(express.json({ limit: "50mb" }));
-
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const CLIENT_VERSION = "2.20250320.01.00";
+
 /* ══════════════════════════════════════════════════════════
-   YOUTUBE TRANSCRIPT
-   Uses youtube-transcript package (58k weekly downloads)
-   which handles Android Innertube API + web scraping fallback
+   YOUTUBE TRANSCRIPT — 3 methods in sequence
    ══════════════════════════════════════════════════════════ */
 app.get("/api/youtube/:videoId", async (req, res) => {
   const { videoId } = req.params;
-  console.log(`[YT] === Fetching: ${videoId} ===`);
+  console.log(`\n[YT] ========== Fetching: ${videoId} ==========`);
 
+  // Get title via oEmbed (always works, lightweight)
+  let title = "YouTube Video";
   try {
-    // Get video title via oEmbed (lightweight, no auth needed)
-    let title = "YouTube Video";
+    const oR = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
+    if (oR.ok) { const j = await oR.json(); title = j.title || title; }
+    console.log(`[YT] Title: "${title}"`);
+  } catch (_) {}
+
+  const errors = [];
+
+  // ══ METHOD 1: youtube-transcript npm package ══
+  if (fetchTranscriptPkg) {
     try {
-      const oR = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`);
-      if (oR.ok) { const j = await oR.json(); title = j.title || title; }
-      console.log(`[YT] Title: "${title}"`);
-    } catch (_) { console.log("[YT] oEmbed failed, continuing"); }
+      console.log("[YT] Method 1: youtube-transcript package...");
+      let raw;
+      try { raw = await fetchTranscriptPkg(videoId, { lang: "en" }); }
+      catch (_) { raw = await fetchTranscriptPkg(videoId); }
 
-    // Fetch transcript — the package handles all the complexity:
-    // 1. Tries Android Innertube API first
-    // 2. Falls back to web page scraping
-    // 3. Handles caption URL extraction and XML parsing
-    console.log("[YT] Fetching transcript...");
-    
-    let raw;
-    try {
-      // Try with English preference first
-      raw = await fetchTranscript(videoId, { lang: "en" });
-    } catch (langErr) {
-      console.log(`[YT] English failed: ${langErr.message}, trying any language...`);
-      raw = await fetchTranscript(videoId);
+      if (raw && raw.length > 0) {
+        const entries = groupIntoParagraphs(raw.map(r => ({
+          start: (r.offset || 0) / 1000,
+          duration: (r.duration || 0) / 1000,
+          text: (r.text || "").trim(),
+        })).filter(e => e.text));
+
+        if (entries.length > 0) {
+          console.log(`[YT] ✅ Method 1 SUCCESS — ${entries.length} paragraphs`);
+          return res.json({ success: true, title, language: raw[0]?.lang || "en", totalDuration: entries[entries.length - 1]?.timestamp || 0, entries });
+        }
+      }
+    } catch (e) {
+      console.log(`[YT] Method 1 failed: ${e.message}`);
+      errors.push(`Package: ${e.message}`);
     }
+  }
 
-    if (!raw || raw.length === 0) {
-      throw new Error("No transcript segments returned. The video may not have captions.");
-    }
+  // ══ METHOD 2: /next + /get_transcript endpoint chain ══
+  // This is how production tools extract transcripts.
+  // Step A: Call /next to get engagement panel params
+  // Step B: Use those params with /get_transcript
+  try {
+    console.log("[YT] Method 2: next + get_transcript endpoints...");
 
-    console.log(`[YT] Got ${raw.length} raw segments`);
-    console.log(`[YT] Sample: ${JSON.stringify(raw[0])}`);
-
-    // Map to our format (package returns offset in ms, duration in ms)
-    const mapped = raw.map(r => ({
-      start: typeof r.offset === "number" ? r.offset / 1000 : parseFloat(r.offset || 0) / 1000,
-      duration: typeof r.duration === "number" ? r.duration / 1000 : parseFloat(r.duration || 0) / 1000,
-      text: (r.text || "").trim(),
-    })).filter(e => e.text);
-
-    // Group into ~30 second paragraphs for readability
-    const entries = groupIntoParagraphs(mapped);
-
-    console.log(`[YT] ✅ SUCCESS — ${entries.length} paragraphs from ${mapped.length} segments`);
-    return res.json({
-      success: true,
-      title,
-      language: raw[0]?.lang || "en",
-      totalDuration: mapped[mapped.length - 1]?.start || 0,
-      entries,
+    // Step A: Call /next
+    console.log("[YT]   Step A: Calling /youtubei/v1/next...");
+    const nextR = await fetch("https://www.youtube.com/youtubei/v1/next?prettyPrint=false", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": UA },
+      body: JSON.stringify({
+        context: { client: { clientName: "WEB", clientVersion: CLIENT_VERSION, hl: "en", gl: "US" } },
+        videoId,
+      }),
     });
 
-  } catch (err) {
-    console.error(`[YT] ❌ FAILED: ${err.message}`);
-    
-    // Provide user-friendly error messages
-    let userMsg = err.message;
-    if (err.message.includes("disabled")) userMsg = "Transcripts are disabled on this video by the creator.";
-    else if (err.message.includes("No transcripts are available")) userMsg = "No captions/subtitles available for this video.";
-    else if (err.message.includes("no longer available")) userMsg = "This video is unavailable or private.";
-    else if (err.message.includes("too many requests") || err.message.includes("captcha")) userMsg = "YouTube is rate-limiting requests. Please try again in a few minutes.";
-    
-    res.status(500).json({ success: false, error: userMsg });
+    if (!nextR.ok) throw new Error(`/next returned HTTP ${nextR.status}`);
+    const nextData = await nextR.json();
+    console.log(`[YT]   /next response received (keys: ${Object.keys(nextData).join(", ")})`);
+
+    // Find getTranscriptEndpoint params in the response
+    let transcriptParams = null;
+    const findParams = (obj, depth = 0) => {
+      if (!obj || typeof obj !== "object" || depth > 15 || transcriptParams) return;
+      if (obj.getTranscriptEndpoint?.params) { transcriptParams = obj.getTranscriptEndpoint.params; return; }
+      if (Array.isArray(obj)) { for (const item of obj) findParams(item, depth + 1); }
+      else { for (const v of Object.values(obj)) findParams(v, depth + 1); }
+    };
+    findParams(nextData);
+
+    if (!transcriptParams) {
+      console.log("[YT]   No getTranscriptEndpoint found in /next response");
+      throw new Error("Video does not expose transcript endpoint (no getTranscriptEndpoint in engagement panels)");
+    }
+    console.log(`[YT]   Found transcript params: ${transcriptParams.slice(0, 40)}...`);
+
+    // Step B: Call /get_transcript with params
+    console.log("[YT]   Step B: Calling /youtubei/v1/get_transcript...");
+    const trR = await fetch("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": UA },
+      body: JSON.stringify({
+        context: { client: { clientName: "WEB", clientVersion: CLIENT_VERSION, hl: "en", gl: "US" } },
+        params: transcriptParams,
+      }),
+    });
+
+    if (!trR.ok) throw new Error(`/get_transcript returned HTTP ${trR.status}`);
+    const trData = await trR.json();
+
+    // Extract transcript segments from response
+    const segments = [];
+    const findSegments = (obj, depth = 0) => {
+      if (!obj || typeof obj !== "object" || depth > 20) return;
+      if (obj.transcriptSegmentRenderer) {
+        const seg = obj.transcriptSegmentRenderer;
+        let text = "";
+        if (seg.snippet?.runs) text = seg.snippet.runs.map(r => r.text || "").join("");
+        else if (seg.snippet?.simpleText) text = seg.snippet.simpleText;
+        else if (typeof seg.snippet === "string") text = seg.snippet;
+        text = text.replace(/\n/g, " ").trim();
+        if (text) segments.push({
+          start: parseInt(seg.startMs || "0") / 1000,
+          duration: (parseInt(seg.endMs || "0") - parseInt(seg.startMs || "0")) / 1000,
+          text,
+        });
+        return;
+      }
+      if (Array.isArray(obj)) { for (const item of obj) findSegments(item, depth + 1); }
+      else { for (const v of Object.values(obj)) findSegments(v, depth + 1); }
+    };
+    findSegments(trData);
+
+    if (segments.length === 0) {
+      console.log("[YT]   get_transcript returned data but no segments found");
+      throw new Error("Transcript response contained no segments");
+    }
+
+    const entries = groupIntoParagraphs(segments);
+    console.log(`[YT] ✅ Method 2 SUCCESS — ${entries.length} paragraphs from ${segments.length} segments`);
+    return res.json({ success: true, title, language: "en", totalDuration: segments[segments.length - 1]?.start || 0, entries });
+
+  } catch (e) {
+    console.log(`[YT] Method 2 failed: ${e.message}`);
+    errors.push(`Innertube: ${e.message}`);
   }
+
+  // ══ METHOD 3: Direct page scraping + caption URL fetch ══
+  try {
+    console.log("[YT] Method 3: Direct page scraping...");
+    const pageR = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: { "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Cookie": "CONSENT=PENDING+999;" },
+    });
+    if (!pageR.ok) throw new Error(`YouTube page HTTP ${pageR.status}`);
+    const html = await pageR.text();
+    console.log(`[YT]   Page: ${html.length} chars`);
+
+    // Try to extract ytInitialPlayerResponse
+    const match = html.match(/var ytInitialPlayerResponse\s*=\s*(\{.+?\});/);
+    if (!match) {
+      // Try alternate pattern
+      const match2 = html.match(/"captionTracks"\s*:\s*(\[.*?\])/);
+      if (!match2) throw new Error("No player response or caption tracks found in page");
+
+      const tracks = JSON.parse(match2[1]);
+      console.log(`[YT]   Found ${tracks.length} caption tracks from page HTML`);
+      const track = tracks.find(t => t.languageCode === "en") || tracks[0];
+      if (!track?.baseUrl) throw new Error("No caption base URL");
+
+      // Try fetching with cookies from the page response
+      const cookies = (pageR.headers.get("set-cookie") || "").split(",").map(c => c.split(";")[0].trim()).filter(Boolean).join("; ");
+      const capR = await fetch(track.baseUrl, { headers: { "User-Agent": UA, "Cookie": cookies } });
+      if (!capR.ok) throw new Error(`Caption fetch HTTP ${capR.status}`);
+      const capText = await capR.text();
+      if (capText.length < 50) throw new Error("Caption response empty");
+
+      const entries = parseXmlTranscript(capText);
+      if (entries.length > 0) {
+        console.log(`[YT] ✅ Method 3 SUCCESS (captionTracks) — ${entries.length} paragraphs`);
+        return res.json({ success: true, title, language: track.languageCode || "en", totalDuration: entries[entries.length - 1]?.timestamp || 0, entries });
+      }
+      throw new Error("Could not parse caption XML");
+    }
+
+    // Parse ytInitialPlayerResponse
+    let playerResponse;
+    try { playerResponse = JSON.parse(match[1]); } catch (_) { throw new Error("Failed to parse player response JSON"); }
+
+    const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!tracks || tracks.length === 0) throw new Error("No caption tracks in player response");
+    console.log(`[YT]   Found ${tracks.length} tracks in player response`);
+
+    const track = tracks.find(t => t.languageCode === "en") || tracks[0];
+    const cookies = (pageR.headers.get("set-cookie") || "").split(",").map(c => c.split(";")[0].trim()).filter(Boolean).join("; ");
+    const capR = await fetch(track.baseUrl, { headers: { "User-Agent": UA, "Cookie": cookies } });
+    if (!capR.ok) throw new Error(`Caption fetch HTTP ${capR.status}`);
+    const capText = await capR.text();
+    if (capText.length < 50) throw new Error(`Caption response too short (${capText.length} chars)`);
+
+    const entries = parseXmlTranscript(capText);
+    if (entries.length > 0) {
+      console.log(`[YT] ✅ Method 3 SUCCESS (playerResponse) — ${entries.length} paragraphs`);
+      return res.json({ success: true, title, language: track.languageCode || "en", totalDuration: entries[entries.length - 1]?.timestamp || 0, entries });
+    }
+    throw new Error("Parsed 0 entries from caption XML");
+
+  } catch (e) {
+    console.log(`[YT] Method 3 failed: ${e.message}`);
+    errors.push(`Page scrape: ${e.message}`);
+  }
+
+  // All methods failed
+  console.error(`[YT] ❌ ALL METHODS FAILED`);
+  errors.forEach((e, i) => console.log(`  ${i + 1}. ${e}`));
+
+  let userMessage = "Could not extract transcript. ";
+  if (errors.some(e => e.includes("disabled"))) userMessage += "Transcripts may be disabled for this video.";
+  else if (errors.some(e => e.includes("too many"))) userMessage += "YouTube is rate-limiting. Try again in a few minutes.";
+  else userMessage += "YouTube may be blocking our server. Please try a different video or try again later.";
+
+  res.status(500).json({ success: false, error: userMessage });
 });
+
+/* ── Parse XML transcript formats ── */
+function parseXmlTranscript(xml) {
+  const raw = [];
+
+  // Format 1: <p t="ms" d="ms">...</p> (srv3 style)
+  let regex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    let text = match[3].replace(/<[^>]+>/g, "");
+    text = decodeEntities(text).trim();
+    if (text) raw.push({ start: parseInt(match[1]) / 1000, duration: parseInt(match[2]) / 1000, text });
+  }
+  if (raw.length > 0) return groupIntoParagraphs(raw);
+
+  // Format 2: <text start="s" dur="s">...</text>
+  regex = /<text\s+start="([^"]*)"(?:\s+dur="([^"]*)")?[^>]*>([\s\S]*?)<\/text>/g;
+  while ((match = regex.exec(xml)) !== null) {
+    const text = decodeEntities(match[3]).trim();
+    if (text) raw.push({ start: parseFloat(match[1]), duration: parseFloat(match[2] || "0"), text });
+  }
+  return groupIntoParagraphs(raw);
+}
+
+function decodeEntities(s) {
+  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;|&#x27;|&apos;/g, "'").replace(/\n/g, " ");
+}
 
 function groupIntoParagraphs(raw) {
   if (raw.length === 0) return [];
@@ -128,50 +299,27 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
       try {
         console.log(`[TR] Attempt ${attempt + 1}/3 (${mime})...`);
         const r = await fetch("https://api-inference.huggingface.co/models/openai/whisper-small", {
-          method: "POST",
-          headers: { "Content-Type": mime },
-          body: req.file.buffer,
+          method: "POST", headers: { "Content-Type": mime }, body: req.file.buffer,
         });
         if (r.ok) { result = await r.json(); break; }
-
-        const errBody = await r.json().catch(() => ({}));
-        if (errBody.error?.includes("loading") || r.status === 503) {
-          console.log("[TR] Model loading, waiting 15s...");
-          await new Promise(r => setTimeout(r, 15000));
-          continue;
-        }
-        if (r.status === 429) {
-          console.log("[TR] Rate limited, waiting 10s...");
-          await new Promise(r => setTimeout(r, 10000));
-          continue;
-        }
-        throw new Error(errBody.error || `Whisper API HTTP ${r.status}`);
-      } catch (e) {
-        if (attempt === 2) throw e;
-        console.log(`[TR] Retry: ${e.message}`);
-        await new Promise(r => setTimeout(r, 5000));
-      }
+        const e = await r.json().catch(() => ({}));
+        if (e.error?.includes("loading") || r.status === 503) { console.log("[TR] Loading..."); await new Promise(r => setTimeout(r, 15000)); continue; }
+        if (r.status === 429) { console.log("[TR] Rate limited..."); await new Promise(r => setTimeout(r, 10000)); continue; }
+        throw new Error(e.error || `HTTP ${r.status}`);
+      } catch (e) { if (attempt === 2) throw e; await new Promise(r => setTimeout(r, 5000)); }
     }
-    if (!result) throw new Error("Transcription service unavailable after 3 attempts. Try again later.");
-    console.log(`[TR] Result: text=${!!result.text}, chunks=${result.chunks?.length || 0}`);
+    if (!result) throw new Error("Transcription unavailable after retries.");
+    console.log(`[TR] text=${!!result.text}, chunks=${result.chunks?.length || 0}`);
 
     let entries = [];
     if (result.chunks?.length > 0) {
-      entries = result.chunks.map(ch => ({
-        timestamp: ch.timestamp?.[0] ?? 0,
-        text: (ch.text || "").trim(),
-      })).filter(e => e.text);
+      entries = result.chunks.map(ch => ({ timestamp: ch.timestamp?.[0] ?? 0, text: (ch.text || "").trim() })).filter(e => e.text);
     } else if (result.text) {
-      const sentences = result.text.match(/[^.!?]+[.!?]+/g) || [result.text];
-      const total = sentences.reduce((s, t) => s + t.length, 0);
-      let elapsed = 0;
-      entries = sentences.map(s => {
-        const entry = { timestamp: elapsed, text: s.trim() };
-        elapsed += (s.length / total) * sentences.length * 5;
-        return entry;
-      }).filter(e => e.text);
+      const ss = result.text.match(/[^.!?]+[.!?]+/g) || [result.text];
+      const total = ss.reduce((s, t) => s + t.length, 0);
+      let el = 0;
+      entries = ss.map(s => { const en = { timestamp: el, text: s.trim() }; el += (s.length / total) * ss.length * 5; return en; }).filter(e => e.text);
     }
-
     const para = groupIntoParagraphs(entries.map(e => ({ start: e.timestamp, duration: 2, text: e.text })));
     console.log(`[TR] ✅ ${para.length} paragraphs`);
     res.json({ success: true, entries: para.length > 0 ? para : entries });
@@ -186,47 +334,29 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
    ══════════════════════════════════════════════════════════ */
 app.post("/api/analyze", async (req, res) => {
   const { system, prompt } = req.body;
-  console.log("[AI] Running analysis...");
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY || "",
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        system,
-        messages: [{ role: "user", content: prompt }],
-      }),
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY || "", "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, system, messages: [{ role: "user", content: prompt }] }),
     });
-    if (!r.ok) throw new Error(`Claude API HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`Claude HTTP ${r.status}`);
     const data = await r.json();
-    const text = data.content?.map(b => b.text || "").join("") || "";
-    console.log("[AI] ✅ Done");
-    res.json({ success: true, text });
-  } catch (err) {
-    console.error("[AI] ❌", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+    res.json({ success: true, text: data.content?.map(b => b.text || "").join("") || "" });
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
 });
 
 /* ── Serve frontend ── */
-app.get("*", (req, res) => {
-  res.sendFile(join(__dirname, "index.html"));
-});
+app.get("*", (req, res) => res.sendFile(join(__dirname, "index.html")));
 
-/* ── Start ── */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`
   ╔══════════════════════════════════════════╗
   ║         TranscriptAI v1.0                ║
   ║   Port: ${PORT}                              ║
-  ║   YouTube:  ✅ Ready                      ║
-  ║   Upload:   ✅ Ready                      ║
+  ║   YouTube:  ✅ (3-method fallback)        ║
+  ║   Upload:   ✅ (Whisper AI)               ║
   ║   AI:       ${process.env.ANTHROPIC_API_KEY ? "✅ Ready" : "⚠️  Set ANTHROPIC_API_KEY"}                     ║
   ╚══════════════════════════════════════════╝
   `);
