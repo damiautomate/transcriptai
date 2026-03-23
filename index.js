@@ -285,13 +285,15 @@ app.post("/api/transcribe", upload.single("audio"), async (req, res) => {
   console.log(`[TR] Processing: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(1)} MB)`);
 
   const mimeMap = {
-    mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/mp4", flac: "audio/flac",
-    ogg: "audio/ogg", aac: "audio/aac", wma: "audio/x-ms-wma", opus: "audio/opus",
-    mp4: "video/mp4", mov: "video/quicktime", avi: "video/x-msvideo",
-    mkv: "video/x-matroska", webm: "video/webm",
+    mp3: "audio/mpeg", wav: "audio/wav", m4a: "audio/m4a", flac: "audio/flac",
+    ogg: "audio/ogg", aac: "audio/mpeg", wma: "audio/mpeg", opus: "audio/webm;codecs=opus",
+    mp4: "audio/mpeg", mov: "audio/mpeg", avi: "audio/mpeg",
+    mkv: "audio/mpeg", webm: "audio/webm",
   };
   const ext = req.file.originalname.split(".").pop().toLowerCase();
-  const mime = mimeMap[ext] || req.file.mimetype || "audio/mpeg";
+  const isVideo = ["mp4","mov","avi","mkv"].includes(ext);
+  const mime = mimeMap[ext] || "audio/mpeg";
+  if (isVideo) console.log(`[TR] Video file detected — sending as audio/mpeg`);
 
   try {
     let result = null;
